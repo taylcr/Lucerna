@@ -1,0 +1,5 @@
+pip install opencv-python-headless torch torchvision
+pip install --user ultralytics[yolov5]
+
+pip install pillow
+
