@@ -3,3 +3,15 @@ pip install --user ultralytics[yolov5]
 
 pip install pillow
 
+
+// tracker >
+pip install --upgrade opencv-python opencv-contrib-python
+
+
+//TTS
+
+pip install pyttsx3
+
+
+// YOLO v8
+pip install ultralytics
