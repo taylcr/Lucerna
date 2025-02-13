@@ -1,0 +1,8 @@
+numpy<2
+torch
+torchvision
+ultralytics
+opencv-python
+pyttsx3
+pygame
+sort-tracker

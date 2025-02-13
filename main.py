@@ -1,469 +1,295 @@
-#!/usr/bin/env python3
-"""
-All-in-One DepthAI Example
-– Displays a color camera feed with spatial-location warnings (if an object is too near),
-– Shows a blended undistorted RGB/depth image (with adjustable blend and FPS display),
-– Runs feature tracking (with motion estimation) on the left mono camera,
-– Runs MobileNet‑SSD object detection on the right mono camera.
-"""
-
 import cv2
-import depthai as dai
+import torch
 import numpy as np
-import math
-import time
-from datetime import timedelta
-from collections import deque
-from pathlib import Path
-import sys
+import pyttsx3         # For text-to-speech
+import threading       # To run TTS non-blocking
+from sort import Sort  # Ensure you have the SORT tracker installed
+import pygame          # For audio feedback
+import depthai as dai  # For OAK-D Lite
 
-# ---------------------------- User Parameters ----------------------------
+# Initialize pygame mixer
+pygame.mixer.init()
 
-# For spatial warnings (in millimeters)
-WARNING = 500   # e.g. 500mm = 50cm (orange rectangle)
-CRITICAL = 300  # e.g. 300mm = 30cm (red rectangle)
+# Load a smaller (optimized) YOLOv5 model for speed.
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
+model.conf = 0.4  # Confidence threshold
+model.iou = 0.5   # NMS IoU threshold
+model.eval()
 
-# FPS for some pipelines
-FPS = 30.0
+# Initialize the SORT tracker
+tracker = Sort()
 
-# For MobileNet SSD: default blob path (you may pass a different path as first argument)
-nnPath = str((Path(__file__).parent / Path(r'models\mobilenet-ssd_openvino_2021.4_6shave.blob')).resolve().absolute())
-if len(sys.argv) > 1:
-    nnPath = sys.argv[1]
-if not Path(nnPath).exists():
-    raise FileNotFoundError(f"Required blob file not found: {nnPath}")
+# Global variables for object tracking and control
+tracked_id = None
+id_buffer = ""       # Buffer for manual ID entry
+selection_mode = False
+selected_object_idx = 0
+object_id_map = {}
+next_id = 1
 
-# MobileNetSSD label texts
-labelMap = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle",
-            "bus", "car", "cat", "chair", "cow", "diningtable", "dog", "horse",
-            "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor"]
+# Distance and guidance thresholds
+CENTER_TOLERANCE = 50
+CLOSE_ENOUGH_THRESHOLD = 20000  # (for area comparison; adjust as needed)
+object_centered_once = False    # To say "centered" only once
 
-# Blend weights for RGB/depth window (global so that trackbar callback can update them)
-rgbWeight = 0.4
-depthWeight = 0.6
+# Text-to-speech engine
+tts_engine = pyttsx3.init()
 
-# ---------------------------- Utility Classes and Functions ----------------------------
+def speak_async(text):
+    """Run TTS in a separate thread."""
+    threading.Thread(target=lambda: (tts_engine.say(text), tts_engine.runAndWait())).start()
 
-class FPSCounter:
-    def __init__(self):
-        self.frameTimes = []
+def get_unique_id():
+    global next_id
+    unique_id = next_id
+    next_id += 1
+    return unique_id
 
-    def tick(self):
-        now = time.time()
-        self.frameTimes.append(now)
-        self.frameTimes = self.frameTimes[-10:]
+def assign_ids(tracked_objects):
+    """Assign unique (simplified) IDs to tracked objects."""
+    global object_id_map
+    for obj in tracked_objects:
+        tracker_id = int(obj[-1])
+        if tracker_id not in object_id_map:
+            object_id_map[tracker_id] = get_unique_id()
+        obj[-1] = object_id_map[tracker_id]
 
-    def getFps(self):
-        if len(self.frameTimes) <= 1:
-            return 0
-        return (len(self.frameTimes) - 1) / (self.frameTimes[-1] - self.frameTimes[0])
+def play_sound(sound_file):
+    """Play the specified sound file."""
+    pygame.mixer.music.load(sound_file)
+    pygame.mixer.music.play()
 
-
-def updateBlendWeights(percentRgb):
-    """Callback for trackbar to update blending weights."""
-    global rgbWeight, depthWeight
-    rgbWeight = float(percentRgb) / 100.0
-    depthWeight = 1.0 - rgbWeight
-
-
-def colorizeDepth(frameDepth):
-    """Colorizes a depth frame using a logarithmic scale and a JET colormap."""
-    invalidMask = frameDepth == 0
-    try:
-        valid = frameDepth[frameDepth != 0]
-        if len(valid) == 0:
-            minDepth = 0
-            maxDepth = 0
-        else:
-            minDepth = np.percentile(valid, 3)
-            maxDepth = np.percentile(valid, 95)
-        logDepth = np.log(frameDepth, where=frameDepth != 0)
-        logMinDepth = np.log(minDepth) if minDepth > 0 else 0
-        logMaxDepth = np.log(maxDepth) if maxDepth > 0 else 1
-        np.nan_to_num(logDepth, copy=False, nan=logMinDepth)
-        logDepth = np.clip(logDepth, logMinDepth, logMaxDepth)
-        depthFrameColor = np.interp(logDepth, (logMinDepth, logMaxDepth), (0, 255))
-        depthFrameColor = np.nan_to_num(depthFrameColor)
-        depthFrameColor = depthFrameColor.astype(np.uint8)
-        depthFrameColor = cv2.applyColorMap(depthFrameColor, cv2.COLORMAP_JET)
-        depthFrameColor[invalidMask] = 0
-    except Exception as e:
-        depthFrameColor = np.zeros((frameDepth.shape[0], frameDepth.shape[1], 3), dtype=np.uint8)
-    return depthFrameColor
-
-
-def frameNorm(frame, bbox):
+def guidance_feedback(object_box, frame_center, current_area, previous_area):
     """
-    Normalizes a bounding box (in 0..1 range) to image coordinates.
-    bbox: tuple (xmin, ymin, xmax, ymax)
+    Provide guidance feedback based on the object's bounding box and frame center.
+    (This function can be extended to also use depth if desired.)
     """
-    normVals = np.full(len(bbox), frame.shape[0])
-    normVals[::2] = frame.shape[1]
-    return (np.clip(np.array(bbox), 0, 1) * normVals).astype(int)
+    global object_centered_once
+    x1, y1, x2, y2 = object_box
+    x_frame, y_frame = frame_center
 
+    if x1 <= x_frame <= x2 and y1 <= y_frame <= y2:
+        if not object_centered_once:
+            speak_async("centered")
+            print("centered")
+            object_centered_once = True
 
-# ---------------------------- Feature Tracking Classes ----------------------------
+        if current_area >= CLOSE_ENOUGH_THRESHOLD:
+            play_sound("end.mp3")
+        elif previous_area is not None and current_area > previous_area:
+            play_sound("step.mp3")
+    else:
+        object_centered_once = False
+        directions = []
+        if x_frame < x1:
+            directions.append("right")
+        elif x_frame > x2:
+            directions.append("left")
+        if y_frame < y1:
+            directions.append("down")
+        elif y_frame > y2:
+            directions.append("up")
+        if directions:
+            direction_text = ", ".join(directions)
+            speak_async(direction_text)
+            print(direction_text)
 
-class CameraMotionEstimator:
-    def __init__(self, filter_weight=0.5, motion_threshold=0.01, rotation_threshold=0.05):
-        self.last_avg_flow = np.array([0.0, 0.0])
-        self.filter_weight = filter_weight
-        self.motion_threshold = motion_threshold
-        self.rotation_threshold = rotation_threshold
+def describe_objects(detections, class_names):
+    """Describe detected objects from left to right."""
+    descriptions = []
+    for i, detection in enumerate(detections):
+        x1, y1, x2, y2, obj_id = map(int, detection[:5])
+        descriptions.append(f"{class_names[i]} ID {obj_id}")
+    if descriptions:
+        description_text = " | ".join(descriptions)
+        speak_async(description_text)
+        print(description_text)
 
-    def estimate_motion(self, feature_paths):
-        most_prominent_motion = "Camera Staying Still"
-        max_magnitude = 0.0
-        avg_flow = np.array([0.0, 0.0])
-        total_rotation = 0.0
-        vanishing_point = np.array([0.0, 0.0])
-        num_features = len(feature_paths)
+def cycle_objects(key, tracked_objects, class_names):
+    """Cycle through objects when in selection mode."""
+    global selected_object_idx
+    if tracked_objects.size > 0 and selection_mode:
+        num_objects = len(tracked_objects)
+        selected_object_idx = (selected_object_idx + (1 if key == ord('l') else -1)) % num_objects
+        x1, y1, x2, y2, obj_id = map(int, tracked_objects[selected_object_idx][:5])
+        object_name = class_names[selected_object_idx] if selected_object_idx < len(class_names) else "object"
+        speak_async(f"{object_name} with ID {obj_id}")
+        print(f"Selected: {object_name} ID: {obj_id}")
 
-        # Debug print:
-        print(f"Number of features: {num_features}")
+def reset_tracking():
+    """Reset tracking and selection states."""
+    global tracked_id, id_buffer, selection_mode, selected_object_idx, object_centered_once
+    tracked_id = None
+    id_buffer = ""
+    selection_mode = False
+    selected_object_idx = 0
+    object_centered_once = False
+    print("Tracking and selection reset.")
 
-        if num_features == 0:
-            return most_prominent_motion, vanishing_point
-
-        for path in feature_paths.values():
-            if len(path) >= 2:
-                src = np.array([path[-2].x, path[-2].y])
-                dst = np.array([path[-1].x, path[-1].y])
-                avg_flow += dst - src
-                motion_vector = dst + (dst - src)
-                vanishing_point += motion_vector
-                rotation = np.arctan2(dst[1] - src[1], dst[0] - src[0])
-                total_rotation += rotation
-
-        avg_flow /= num_features
-        avg_rotation = total_rotation / num_features
-        vanishing_point /= num_features
-
-        print(f"Average Flow: {avg_flow}")
-        print(f"Average Rotation: {avg_rotation}")
-
-        avg_flow = (self.filter_weight * self.last_avg_flow + (1 - self.filter_weight) * avg_flow)
-        self.last_avg_flow = avg_flow
-
-        flow_magnitude = np.linalg.norm(avg_flow)
-        rotation_magnitude = abs(avg_rotation)
-
-        if flow_magnitude > max_magnitude and flow_magnitude > self.motion_threshold:
-            if abs(avg_flow[0]) > abs(avg_flow[1]):
-                most_prominent_motion = 'Right' if avg_flow[0] < 0 else 'Left'
-            else:
-                most_prominent_motion = 'Down' if avg_flow[1] < 0 else 'Up'
-            max_magnitude = flow_magnitude
-
-        if rotation_magnitude > max_magnitude and rotation_magnitude > self.rotation_threshold:
-            most_prominent_motion = 'Rotating'
-
-        return most_prominent_motion, vanishing_point
-
-
-class FeatureTrackerDrawer:
-    lineColor = (200, 0, 200)
-    pointColor = (0, 0, 255)
-    vanishingPointColor = (255, 0, 255)  # Violet
-    circleRadius = 2
-    maxTrackedFeaturesPathLength = 30
-    trackedFeaturesPathLength = 10
-
-    trackedIDs = None
-    trackedFeaturesPath = None
-
-    direction_colors = {
-        "Up": (0, 255, 255),    # Yellow
-        "Down": (0, 255, 0),    # Green
-        "Left": (255, 0, 0),    # Blue
-        "Right": (0, 0, 255),   # Red
-    }
-
-    def __init__(self, windowName):
-        self.windowName = windowName
-        cv2.namedWindow(windowName)
-        self.trackedIDs = set()
-        self.trackedFeaturesPath = dict()
-
-    def trackFeaturePath(self, features):
-        newTrackedIDs = set()
-        for currentFeature in features:
-            currentID = currentFeature.id
-            newTrackedIDs.add(currentID)
-
-            if currentID not in self.trackedFeaturesPath:
-                self.trackedFeaturesPath[currentID] = deque()
-
-            path = self.trackedFeaturesPath[currentID]
-            path.append(currentFeature.position)
-            while len(path) > max(1, FeatureTrackerDrawer.trackedFeaturesPathLength):
-                path.popleft()
-            self.trackedFeaturesPath[currentID] = path
-
-        featuresToRemove = set()
-        for oldId in self.trackedIDs:
-            if oldId not in newTrackedIDs:
-                featuresToRemove.add(oldId)
-        for id in featuresToRemove:
-            self.trackedFeaturesPath.pop(id, None)
-        self.trackedIDs = newTrackedIDs
-
-    def drawVanishingPoint(self, img, vanishing_point):
-        cv2.circle(img, (int(vanishing_point[0]), int(vanishing_point[1])), self.circleRadius,
-                   self.vanishingPointColor, -1, cv2.LINE_AA, 0)
-
-    def drawFeatures(self, img, vanishing_point=None, prominent_motion=None):
-        if prominent_motion in self.direction_colors:
-            point_color = self.direction_colors[prominent_motion]
-        else:
-            point_color = self.pointColor
-
-        for featurePath in self.trackedFeaturesPath.values():
-            path = featurePath
-            for j in range(len(path) - 1):
-                src = (int(path[j].x), int(path[j].y))
-                dst = (int(path[j + 1].x), int(path[j + 1].y))
-                cv2.line(img, src, dst, point_color, 1, cv2.LINE_AA, 0)
-            if len(path) > 0:
-                j = len(path) - 1
-                cv2.circle(img, (int(path[j].x), int(path[j].y)), self.circleRadius,
-                           point_color, -1, cv2.LINE_AA, 0)
-
-        if prominent_motion:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 1
-            font_thickness = 2
-            text_size = cv2.getTextSize(prominent_motion, font, font_scale, font_thickness)[0]
-            text_x = (img.shape[1] - text_size[0]) // 2
-            text_y = text_size[1] + 20  # 20 pixels from top
-            text_color = self.direction_colors.get(prominent_motion, (255, 255, 255))
-            cv2.putText(img, prominent_motion, (text_x, text_y), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
-
-        if vanishing_point is not None:
-            self.drawVanishingPoint(img, vanishing_point)
-
-
-# ---------------------------- Build the Pipeline ----------------------------
+###############################################################################
+# Build the DepthAI Pipeline for OAK-D Lite (RGB + Depth)
+###############################################################################
 
 pipeline = dai.Pipeline()
 
-# --------- COLOR CAMERA (CAM_A) ---------
-camRgb = pipeline.create(dai.node.ColorCamera)
+# Color camera node (using CAM_A)
+camRgb = pipeline.createColorCamera()
 camRgb.setBoardSocket(dai.CameraBoardSocket.CAM_A)
-camRgb.setFps(FPS)
-# For the high-resolution (ISP) output used in undistortion and blending:
 camRgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-camRgb.setIspScale(1, 3)  # Downscale ISP output if desired
-# For spatial location overlay, use a low-res preview (e.g. 300x300)
-camRgb.setPreviewSize(300, 300)
+# Use a smaller preview size for faster inference (e.g., 320x240)
+camRgb.setPreviewSize(320, 240)
+camRgb.setInterleaved(False)
 
-# XLinkOut for the color camera (used by spatial location overlay)
-xoutColor = pipeline.create(dai.node.XLinkOut)
-xoutColor.setStreamName("color")
-camRgb.video.link(xoutColor.input)
+# Mono cameras for depth (using CAM_B and CAM_C)
+monoLeft = pipeline.createMonoCamera()
+monoLeft.setBoardSocket(dai.CameraBoardSocket.CAM_B)
+# For OAK-D Lite, use a supported resolution (e.g., 400p)
+monoLeft.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 
-# --------- MONO CAMERAS (LEFT and RIGHT) ---------
-leftMono = pipeline.create(dai.node.MonoCamera)
-leftMono.setBoardSocket(dai.CameraBoardSocket.LEFT)
-leftMono.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-leftMono.setFps(FPS)
+monoRight = pipeline.createMonoCamera()
+monoRight.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+monoRight.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
 
-rightMono = pipeline.create(dai.node.MonoCamera)
-rightMono.setBoardSocket(dai.CameraBoardSocket.RIGHT)
-rightMono.setResolution(dai.MonoCameraProperties.SensorResolution.THE_720_P)
-rightMono.setFps(FPS)
-
-# --------- STEREO DEPTH ---------
-stereo = pipeline.create(dai.node.StereoDepth)
-stereo.initialConfig.setConfidenceThreshold(50)  # Updated API call
+# StereoDepth node
+stereo = pipeline.createStereoDepth()
+stereo.setConfidenceThreshold(50)
 stereo.setLeftRightCheck(True)
 stereo.setExtendedDisparity(True)
-stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.DEFAULT)  # Use DEFAULT preset
-# Align depth to the color camera (CAM_A)
+stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
 stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+monoLeft.out.link(stereo.left)
+monoRight.out.link(stereo.right)
 
-leftMono.out.link(stereo.left)
-rightMono.out.link(stereo.right)
+# XLinkOut for the RGB preview
+xoutRgb = pipeline.createXLinkOut()
+xoutRgb.setStreamName("rgb")
+camRgb.preview.link(xoutRgb.input)
 
-# --------- SPATIAL LOCATION CALCULATOR (for distance warnings) ---------
-slc = pipeline.create(dai.node.SpatialLocationCalculator)
-# Create a grid of ROIs (15 x 9) over the image
-for x in range(15):
-    for y in range(9):
-        config = dai.SpatialLocationCalculatorConfigData()
-        config.depthThresholds.lowerThreshold = 200
-        config.depthThresholds.upperThreshold = 10000
-        config.roi = dai.Rect(dai.Point2f((x + 0.5) * 0.0625, (y + 0.5) * 0.1),
-                              dai.Point2f((x + 1.5) * 0.0625, (y + 1.5) * 0.1))
-        config.calculationAlgorithm = dai.SpatialLocationCalculatorAlgorithm.MEDIAN
-        slc.initialConfig.addROI(config)
-stereo.depth.link(slc.inputDepth)
+# XLinkOut for the aligned depth output
+xoutDepth = pipeline.createXLinkOut()
+xoutDepth.setStreamName("depth_aligned")
+stereo.depth.link(xoutDepth.input)
 
-xoutSlc = pipeline.create(dai.node.XLinkOut)
-xoutSlc.setStreamName("slc")
-slc.out.link(xoutSlc.input)
+###############################################################################
+# Main loop: Run YOLOv5, SORT tracking, and overlay depth information
+###############################################################################
+def main():
+    global tracked_id, id_buffer, selection_mode, selected_object_idx, object_id_map
 
-# --------- SYNC NODE (to bundle RGB and aligned depth for blending) ---------
-sync = pipeline.create(dai.node.Sync)
-sync.setSyncThreshold(timedelta(seconds=0.5 / FPS))
-camRgb.isp.link(sync.inputs["rgb"])
-# Directly link the stereo depth (which is already aligned) to the sync node:
-stereo.depth.link(sync.inputs["depth_aligned"])
+    with dai.Device(pipeline) as device:
+        qRgb = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+        qDepth = device.getOutputQueue(name="depth_aligned", maxSize=4, blocking=False)
+        print("Starting OAK-D Lite stream...")
 
-xoutSync = pipeline.create(dai.node.XLinkOut)
-xoutSync.setStreamName("out")
-sync.out.link(xoutSync.input)
+        previous_area = None
 
-# --------- FEATURE TRACKER (on left mono camera) ---------
-featureTracker = pipeline.create(dai.node.FeatureTracker)
-featureTracker.setHardwareResources(2, 2)
-leftMono.out.link(featureTracker.inputImage)
+        while True:
+            inRgb = qRgb.get()
+            inDepth = qDepth.get()
+            if inRgb is None or inDepth is None:
+                continue
 
-xoutTrackedFeatures = pipeline.create(dai.node.XLinkOut)
-xoutTrackedFeatures.setStreamName("trackedFeaturesLeft")
-featureTracker.outputFeatures.link(xoutTrackedFeatures.input)
+            frame = inRgb.getCvFrame()         # 320x240 color frame
+            depth_frame = inDepth.getFrame()     # Depth frame (typically 16-bit, in millimeters)
 
-xoutPassthroughLeft = pipeline.create(dai.node.XLinkOut)
-xoutPassthroughLeft.setStreamName("passthroughLeft")
-featureTracker.passthroughInputImage.link(xoutPassthroughLeft.input)
+            # Get dimensions of the color frame and depth frame
+            color_h, color_w = frame.shape[:2]
+            depth_h, depth_w = depth_frame.shape[:2]
+            # Compute scale factors in case resolutions differ.
+            scale_x = depth_w / color_w
+            scale_y = depth_h / color_h
 
-# --------- MOBILENET-SSD DETECTION (on right mono camera) ---------
-manip = pipeline.create(dai.node.ImageManip)
-manip.initialConfig.setResize(300, 300)
-manip.initialConfig.setFrameType(dai.ImgFrame.Type.BGR888p)
-rightMono.out.link(manip.inputImage)
+            # Draw crosshair at the center of the color frame.
+            frame_center = (color_w // 2, color_h // 2)
+            cv2.drawMarker(frame, frame_center, (255, 255, 255), cv2.MARKER_CROSS, thickness=2)
 
-nn = pipeline.create(dai.node.MobileNetDetectionNetwork)
-nn.setConfidenceThreshold(0.5)
-nn.setBlobPath(nnPath)
-nn.setNumInferenceThreads(2)
-nn.input.setBlocking(False)
+            # Run YOLOv5 detection on the color frame.
+            with torch.no_grad():
+                results = model(frame)
+            dets = []
+            class_names = []
+            # Each detection: [x1, y1, x2, y2, conf, cls]
+            for *xyxy, conf, cls in results.xyxy[0].cpu().numpy():
+                dets.append([*xyxy, conf])
+                class_names.append(results.names[int(cls)])
+            dets = np.array(dets)
 
-# Link ImageManip output to both the neural network and an output for display.
-manip.out.link(nn.input)
+            # If no detections, show the frame and continue.
+            if dets.size == 0:
+                cv2.imshow('OAK-D Lite: YOLO & Depth', frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                continue
 
-xoutRight = pipeline.create(dai.node.XLinkOut)
-xoutRight.setStreamName("right")
-manip.out.link(xoutRight.input)
+            # Update the SORT tracker and assign simplified IDs.
+            tracked_objects = tracker.update(dets)
+            assign_ids(tracked_objects)
 
-xoutNN = pipeline.create(dai.node.XLinkOut)
-xoutNN.setStreamName("nn")
-nn.out.link(xoutNN.input)
+            key = cv2.waitKey(1) & 0xFF
 
-# ---------------------------- Device Setup and Main Loop ----------------------------
-
-with dai.Device(pipeline) as device:
-    # Get calibration data for undistortion (for the color camera)
-    calibrationHandler = device.readCalibration()
-    # Use CAM_A for calibration since that's the board socket used for the color camera
-    rgbDistortion = calibrationHandler.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
-    rgbIntrinsics = calibrationHandler.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, 1280, 720)
-
-    # Create output queues for all streams
-    qColor = device.getOutputQueue(name="color", maxSize=4, blocking=False)
-    qSlc = device.getOutputQueue(name="slc", maxSize=4, blocking=False)
-    qSync = device.getOutputQueue(name="out", maxSize=8, blocking=False)
-    qTrackedFeatures = device.getOutputQueue(name="trackedFeaturesLeft", maxSize=4, blocking=False)
-    qPassthroughLeft = device.getOutputQueue(name="passthroughLeft", maxSize=4, blocking=False)
-    qRight = device.getOutputQueue(name="right", maxSize=4, blocking=False)
-    qNN = device.getOutputQueue(name="nn", maxSize=4, blocking=False)
-
-    # Set up windows for blended RGB/depth and feature tracking.
-    windowName = "rgb-depth"
-    cv2.namedWindow(windowName, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(windowName, 1280, 720)
-    cv2.createTrackbar("RGB Weight %", windowName, int(rgbWeight * 100), 100, updateBlendWeights)
-
-    left_window_name = "Left"
-    featureDrawer = FeatureTrackerDrawer(left_window_name)
-    cameraEstimator = CameraMotionEstimator(filter_weight=0.5, motion_threshold=0.3, rotation_threshold=0.5)
-
-    fpsCounter = FPSCounter()
-
-    while True:
-        # 1. Spatial Location – get color camera (300x300 preview) and overlay ROI warnings
-        inColor = qColor.tryGet()
-        inSlc = qSlc.tryGet()
-
-        if inColor is not None:
-            colorFrame = inColor.getCvFrame()
-        else:
-            colorFrame = None
-
-        if inSlc is not None and colorFrame is not None:
-            slc_data = inSlc.getSpatialLocations()
-            for depthData in slc_data:
-                roi = depthData.config.roi
-                roi = roi.denormalize(width=colorFrame.shape[1], height=colorFrame.shape[0])
-                xmin = int(roi.topLeft().x)
-                ymin = int(roi.topLeft().y)
-                xmax = int(roi.bottomRight().x)
-                ymax = int(roi.bottomRight().y)
-                coords = depthData.spatialCoordinates
-                distance = math.sqrt(coords.x ** 2 + coords.y ** 2 + coords.z ** 2)
-                if distance == 0:
-                    continue
-                if distance < CRITICAL:
-                    rect_color = (0, 0, 255)  # Red
-                elif distance < WARNING:
-                    rect_color = (0, 140, 255)  # Orange
+            for i, obj in enumerate(tracked_objects):
+                x1, y1, x2, y2, obj_id = map(int, obj[:5])
+                # Compute the center of the bounding box in the color image.
+                cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                # Map the center point to the depth frame coordinates.
+                cx_depth = int(cx * scale_x)
+                cy_depth = int(cy * scale_y)
+                if 0 <= cy_depth < depth_h and 0 <= cx_depth < depth_w:
+                    depth_val = depth_frame[cy_depth, cx_depth]
                 else:
-                    continue  # Only draw for near objects
-                cv2.rectangle(colorFrame, (xmin, ymin), (xmax, ymax), rect_color, 2)
-                cv2.putText(colorFrame, "{:.1f}m".format(distance / 1000), (xmin + 10, ymin + 20),
-                            cv2.FONT_HERSHEY_TRIPLEX, 0.5, rect_color)
-            cv2.imshow("Spatial Location", colorFrame)
+                    depth_val = 0
+                distance_m = depth_val / 1000.0  # Convert mm to meters
 
-        # 2. RGB/Depth Blending (using the sync node’s MessageGroup)
-        msgGroup = qSync.tryGet()
-        if msgGroup is not None:
-            fpsCounter.tick()
-            frameRgb = msgGroup.getMessage("rgb")
-            frameDepth = msgGroup.getMessage("depth_aligned")
-            if frameRgb is not None and frameDepth is not None:
-                cvFrame = frameRgb.getCvFrame()
-                # Undistort the RGB frame
-                cvFrameUndistorted = cv2.undistort(cvFrame, np.array(rgbIntrinsics), np.array(rgbDistortion))
-                alignedDepth = frameDepth.getFrame()
-                alignedDepthColorized = colorizeDepth(alignedDepth)
-                cv2.imshow("Depth aligned", alignedDepthColorized)
-                blended = cv2.addWeighted(cvFrameUndistorted, rgbWeight, alignedDepthColorized, depthWeight, 0)
-                cv2.putText(blended, f"FPS: {fpsCounter.getFps():.2f}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                cv2.imshow(windowName, blended)
+                object_name = class_names[i] if i < len(class_names) else "object"
+                label_text = f'{object_name} ID: {obj_id} {distance_m:.2f}m'
 
-        # 3. Feature Tracking (using left mono passthrough and tracked features)
-        inPassthroughLeft = qPassthroughLeft.tryGet()
-        if inPassthroughLeft is not None:
-            passthroughFrame = inPassthroughLeft.getFrame()  # grayscale image
-            leftFrame = cv2.cvtColor(passthroughFrame, cv2.COLOR_GRAY2BGR)
-            inTrackedFeatures = qTrackedFeatures.tryGet()
-            if inTrackedFeatures is not None:
-                features = inTrackedFeatures.trackedFeatures
-                motion, vanishingPt = cameraEstimator.estimate_motion(featureDrawer.trackedFeaturesPath)
-                featureDrawer.trackFeaturePath(features)
-                featureDrawer.drawFeatures(leftFrame, vanishingPt, motion)
-                cv2.imshow(left_window_name, leftFrame)
-                print("Motions:", motion)
+                if selection_mode and i == selected_object_idx:
+                    color = (255, 0, 0)  # Blue for selected object
+                elif tracked_id is not None and obj_id == tracked_id:
+                    color = (0, 0, 255)  # Red for actively tracked object
+                    object_box = (x1, y1, x2, y2)
+                    current_area = (x2 - x1) * (y2 - y1)
+                    guidance_feedback(object_box, frame_center, current_area, previous_area)
+                    previous_area = current_area
+                else:
+                    color = (0, 255, 0)  # Green for others
 
-        # 4. MobileNet-SSD Object Detection (using right mono processed image)
-        inRight = qRight.tryGet()
-        if inRight is not None:
-            rightFrame = inRight.getCvFrame()
-            inDet = qNN.tryGet()
-            detections = []
-            if inDet is not None:
-                detections = inDet.detections
-            for detection in detections:
-                bbox = frameNorm(rightFrame, (detection.xmin, detection.ymin, detection.xmax, detection.ymax))
-                cv2.putText(rightFrame, labelMap[detection.label], (bbox[0] + 10, bbox[1] + 20),
-                            cv2.FONT_HERSHEY_TRIPLEX, 0.5, (255, 0, 0))
-                cv2.putText(rightFrame, f"{int(detection.confidence * 100)}%", (bbox[0] + 10, bbox[1] + 40),
-                            cv2.FONT_HERSHEY_TRIPLEX, 0.5, (255, 0, 0))
-                cv2.rectangle(rightFrame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (255, 0, 0), 2)
-            cv2.imshow("right", rightFrame)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, label_text, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        if cv2.waitKey(1) == ord('q'):
-            break
+            cv2.imshow('OAK-D Lite: YOLO & Depth', frame)
 
-    cv2.destroyAllWindows()
+            if key == ord('q'):
+                break
+            elif key == ord('v'):
+                describe_objects(tracked_objects, class_names)
+            elif key == ord('t'):
+                selection_mode = True
+                selected_object_idx = 0
+                if tracked_objects.size > 0:
+                    x1, y1, x2, y2, obj_id = map(int, tracked_objects[selected_object_idx][:5])
+                    speak_async(f"Selection mode. {class_names[selected_object_idx]} with ID {obj_id}")
+                    print(f"Selection mode: {class_names[selected_object_idx]} ID: {obj_id}")
+            elif key == ord('r'):
+                reset_tracking()
+            elif ord('0') <= key <= ord('9'):
+                id_buffer += chr(key)
+                print(f"Building ID: {id_buffer}")
+            elif key == 13:  # Enter key
+                try:
+                    tracked_id = int(id_buffer if not selection_mode else tracked_objects[selected_object_idx][-1])
+                    id_buffer = ""
+                    selection_mode = False
+                    speak_async(f"Tracking object ID: {tracked_id}")
+                    print(f"Tracking object ID: {tracked_id}")
+                except ValueError:
+                    print("Invalid ID entered")
+                    id_buffer = ""
+            elif key in {ord('j'), ord('l')} and selection_mode:
+                cycle_objects(key, tracked_objects, class_names)
+
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
